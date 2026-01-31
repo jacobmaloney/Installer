@@ -44,8 +44,8 @@ public class IISDeploymentService
                 var site = CreateSite(serverManager, siteName, physicalPath, appPoolName, port, hostName);
                 serverManager.CommitChanges();
 
-                // Set folder permissions
-                SetFolderPermissions(physicalPath, appPool.ProcessModel.IdentityType);
+                // Set folder permissions (including write access to config files)
+                SetFolderPermissions(physicalPath, appPool.ProcessModel.IdentityType, appPoolName);
 
                 return new DeploymentResult
                 {
@@ -70,8 +70,8 @@ public class IISDeploymentService
                 app.ApplicationPoolName = appPoolName;
                 serverManager.CommitChanges();
 
-                // Set folder permissions
-                SetFolderPermissions(physicalPath, appPool.ProcessModel.IdentityType);
+                // Set folder permissions (including write access to config files)
+                SetFolderPermissions(physicalPath, appPool.ProcessModel.IdentityType, appPoolName);
 
                 return new DeploymentResult
                 {
@@ -128,7 +128,7 @@ public class IISDeploymentService
         return site;
     }
 
-    private void SetFolderPermissions(string physicalPath, ProcessModelIdentityType identityType)
+    private void SetFolderPermissions(string physicalPath, ProcessModelIdentityType identityType, string? appPoolName = null)
     {
         try
         {
@@ -138,14 +138,14 @@ public class IISDeploymentService
             // Get the app pool identity
             string identity = identityType switch
             {
-                ProcessModelIdentityType.ApplicationPoolIdentity => "IIS AppPool\\DefaultAppPool",
+                ProcessModelIdentityType.ApplicationPoolIdentity => $"IIS AppPool\\{appPoolName ?? "DefaultAppPool"}",
                 ProcessModelIdentityType.NetworkService => "NETWORK SERVICE",
                 ProcessModelIdentityType.LocalService => "LOCAL SERVICE",
                 ProcessModelIdentityType.LocalSystem => "LOCAL SYSTEM",
                 _ => "IIS_IUSRS"
             };
 
-            // Add read/execute permissions
+            // Add read/execute permissions to folder
             var rule = new FileSystemAccessRule(
                 identity,
                 FileSystemRights.ReadAndExecute | FileSystemRights.ListDirectory,
@@ -155,11 +155,53 @@ public class IISDeploymentService
 
             security.AddAccessRule(rule);
             directory.SetAccessControl(security);
+
+            // Set write permissions on config files (needed for setup wizard)
+            SetConfigFilePermissions(physicalPath, identity);
         }
         catch
         {
             // Permission setting is best-effort
             // Don't fail deployment if this doesn't work
+        }
+    }
+
+    /// <summary>
+    /// Sets write permissions on configuration files for the app pool identity
+    /// </summary>
+    private void SetConfigFilePermissions(string physicalPath, string identity)
+    {
+        var configFiles = new[]
+        {
+            "appsettings.json",
+            "appsettings.Production.json",
+            "appsettings.Development.json",
+            "connectionstrings.json"
+        };
+
+        foreach (var configFile in configFiles)
+        {
+            var filePath = Path.Combine(physicalPath, configFile);
+            if (File.Exists(filePath))
+            {
+                try
+                {
+                    var fileInfo = new FileInfo(filePath);
+                    var fileSecurity = fileInfo.GetAccessControl();
+
+                    var writeRule = new FileSystemAccessRule(
+                        identity,
+                        FileSystemRights.Modify | FileSystemRights.Read | FileSystemRights.Write,
+                        AccessControlType.Allow);
+
+                    fileSecurity.AddAccessRule(writeRule);
+                    fileInfo.SetAccessControl(fileSecurity);
+                }
+                catch
+                {
+                    // Best effort - continue with other files
+                }
+            }
         }
     }
 
