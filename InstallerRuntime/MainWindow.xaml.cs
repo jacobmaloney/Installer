@@ -293,6 +293,9 @@ public partial class MainWindow : Window
         // Capture UI value on UI thread
         var installPath = TxtInstallPath.Text;
 
+        // Check if there's an existing installation and stop IIS if needed
+        await StopExistingIISSiteAsync(installPath);
+
         var extractor = new ResourceExtractor();
 
         // Log diagnostic info
@@ -385,6 +388,85 @@ public partial class MainWindow : Window
                 throw new Exception(result.Message);
             }
         });
+    }
+
+    private async Task StopExistingIISSiteAsync(string installPath)
+    {
+        try
+        {
+            // Check if there's an existing manifest
+            var existingManifest = await InstallManifest.LoadAsync(installPath);
+            if (existingManifest != null && !string.IsNullOrEmpty(existingManifest.SiteName))
+            {
+                AppendLog($"Found existing installation: {existingManifest.SiteName}");
+                AppendLog("Stopping IIS site to release file locks...");
+
+                var stopResult = await _iisService.StopSiteAndWaitAsync(existingManifest.SiteName, TimeSpan.FromMinutes(1));
+                if (stopResult.Success)
+                {
+                    AppendLog($"Stopped site: {existingManifest.SiteName}");
+                }
+                else
+                {
+                    AppendLog($"Warning: Could not stop site: {stopResult.Message}");
+                }
+
+                return;
+            }
+
+            // No manifest - try to find IIS site by physical path
+            var siteInfo = FindIISSiteByPath(installPath);
+            if (siteInfo != null)
+            {
+                AppendLog($"Found IIS site using this path: {siteInfo.Name}");
+                AppendLog("Stopping IIS site to release file locks...");
+
+                var stopResult = await _iisService.StopSiteAndWaitAsync(siteInfo.Name, TimeSpan.FromMinutes(1));
+                if (stopResult.Success)
+                {
+                    AppendLog($"Stopped site: {siteInfo.Name}");
+                }
+                else
+                {
+                    AppendLog($"Warning: Could not stop site: {stopResult.Message}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Warning: Could not check/stop existing IIS site: {ex.Message}");
+        }
+    }
+
+    private SiteInfo? FindIISSiteByPath(string physicalPath)
+    {
+        try
+        {
+            using var serverManager = new Microsoft.Web.Administration.ServerManager();
+            foreach (var site in serverManager.Sites)
+            {
+                var vdir = site.Applications["/"]?.VirtualDirectories["/"];
+                if (vdir != null)
+                {
+                    var sitePath = Environment.ExpandEnvironmentVariables(vdir.PhysicalPath);
+                    if (string.Equals(sitePath, physicalPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return new SiteInfo
+                        {
+                            Name = site.Name,
+                            State = site.State.ToString(),
+                            PhysicalPath = sitePath,
+                            AppPoolName = site.Applications["/"]?.ApplicationPoolName ?? string.Empty
+                        };
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // IIS not available
+        }
+        return null;
     }
 
     private async Task RegisterApplicationAsync()
