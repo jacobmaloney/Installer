@@ -1,0 +1,30 @@
+<Project>
+  <!--
+    Centralized version management for all Installer projects
+    Version format: {Major}.{Minor}.{Patch}.{Build}
+    Build number format: YYDDD (2-digit year + day of year)
+  -->
+  <PropertyGroup>
+    <VersionMajor>1</VersionMajor>
+    <VersionMinor>0</VersionMinor>
+    <VersionPatch>0</VersionPatch>
+
+    <!-- Auto-generate build number from date (YYDDD format) -->
+    <VersionBuild>$([System.DateTime]::Now.ToString("yy"))$([System.DateTime]::Now.DayOfYear.ToString("000"))</VersionBuild>
+
+    <!-- Combine into full version -->
+    <Version>$(VersionMajor).$(VersionMinor).$(VersionPatch).$(VersionBuild)</Version>
+    <AssemblyVersion>$(VersionMajor).$(VersionMinor).$(VersionPatch).$(VersionBuild)</AssemblyVersion>
+    <FileVersion>$(VersionMajor).$(VersionMinor).$(VersionPatch).$(VersionBuild)</FileVersion>
+    <InformationalVersion>$(Version)</InformationalVersion>
+
+    <!-- Product information -->
+    <Product>Identity Center Installer</Product>
+    <Company>Your Company</Company>
+    <Copyright>Copyright (c) $([System.DateTime]::Now.Year)</Copyright>
+    <Description>Identity Center Installation and Upgrade System</Description>
+
+    <!-- Common settings (TargetFramework set per-project since some use net8.0-windows) -->
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+</Project>
