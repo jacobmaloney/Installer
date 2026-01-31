@@ -82,6 +82,21 @@ public class InstallManifest
     public string MachineName { get; set; } = Environment.MachineName;
 
     /// <summary>
+    /// Product code for Programs and Features registry entry
+    /// </summary>
+    public string ProductCode { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Display name shown in Programs and Features
+    /// </summary>
+    public string DisplayName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Publisher shown in Programs and Features
+    /// </summary>
+    public string Publisher { get; set; } = string.Empty;
+
+    /// <summary>
     /// Custom metadata that can be added by plugins or extensions
     /// </summary>
     public Dictionary<string, string> Metadata { get; set; } = new();

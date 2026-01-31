@@ -3,6 +3,7 @@ using System.Windows.Forms;
 using System.Security.Principal;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using Installer.Core.Services;
 using Installer.Core.Models;
 
@@ -15,7 +16,9 @@ public partial class MainWindow : Window
 {
     private readonly PrerequisiteChecker _prereqChecker;
     private readonly IISDeploymentService _iisService;
+    private readonly WindowsRegistryService _registryService;
     private string? _installUrl;
+    private InstallManifest? _manifest;
 
     public MainWindow()
     {
@@ -25,6 +28,7 @@ public partial class MainWindow : Window
 
             _prereqChecker = new PrerequisiteChecker();
             _iisService = new IISDeploymentService();
+            _registryService = new WindowsRegistryService();
 
             // Set default install path
             TxtInstallPath.Text = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "MyApplication");
@@ -244,6 +248,14 @@ public partial class MainWindow : Window
                 AppendLog("");
             }
 
+            // Step 3: Register in Programs and Features
+            TxtInstallStatus.Text = "Registering application...";
+            AppendLog("Step 3: Registering in Programs and Features");
+
+            await RegisterApplicationAsync();
+            AppendLog("Registered in Programs and Features");
+            AppendLog("");
+
             // Done!
             TxtInstallStatus.Text = "Installation complete!";
             ProgressBar.IsIndeterminate = false;
@@ -373,6 +385,105 @@ public partial class MainWindow : Window
                 throw new Exception(result.Message);
             }
         });
+    }
+
+    private async Task RegisterApplicationAsync()
+    {
+        var installPath = TxtInstallPath.Text;
+        var appName = TxtApplicationName.Text;
+        var siteName = ChkCreateNewSite.IsChecked == true ? TxtSiteName.Text : null;
+        var appPoolName = ChkCreateNewSite.IsChecked == true ? TxtAppPoolName.Text : null;
+        var port = ChkCreateNewSite.IsChecked == true && int.TryParse(TxtPort.Text, out var p) ? p : 0;
+
+        // Generate a product code based on app name
+        var productCode = appName.Replace(" ", "");
+
+        // Get version from assembly or use default
+        var version = Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0, 0);
+        var versionInfo = VersionInfo.FromVersion(version);
+
+        // Create manifest
+        _manifest = new InstallManifest
+        {
+            InstallPath = installPath,
+            SiteName = siteName ?? string.Empty,
+            AppPoolName = appPoolName ?? string.Empty,
+            Port = port,
+            ProductCode = productCode,
+            DisplayName = appName,
+            Publisher = "Your Company",  // Could be made configurable
+            Version = versionInfo
+        };
+
+        // Copy uninstaller to install location
+        var uninstallerPath = CopyUninstallerToInstallLocation(installPath, productCode);
+
+        // Register in Programs and Features
+        var registration = new ApplicationRegistration
+        {
+            ProductCode = productCode,
+            DisplayName = appName,
+            DisplayVersion = versionInfo.ShortVersion,
+            Publisher = _manifest.Publisher,
+            InstallLocation = installPath,
+            UninstallString = $"\"{uninstallerPath}\" /uninstall {productCode}",
+            QuietUninstallString = $"\"{uninstallerPath}\" /uninstall {productCode} /quiet",
+            DisplayIcon = Path.Combine(installPath, "favicon.ico"),
+            EstimatedSizeKB = WindowsRegistryService.CalculateFolderSizeKB(installPath),
+            NoModify = true,
+            NoRepair = true
+        };
+
+        var result = _registryService.RegisterApplication(registration);
+
+        if (!result.Success)
+        {
+            AppendLog($"WARNING: Could not register in Programs and Features: {result.ErrorMessage}");
+        }
+
+        // Save manifest
+        await _manifest.SaveAsync();
+        AppendLog($"Saved installation manifest to: {_manifest.ManifestPath}");
+    }
+
+    private string CopyUninstallerToInstallLocation(string installPath, string productCode)
+    {
+        try
+        {
+            var currentExe = Process.GetCurrentProcess().MainModule?.FileName;
+            if (string.IsNullOrEmpty(currentExe))
+            {
+                currentExe = Assembly.GetExecutingAssembly().Location;
+            }
+
+            // For single-file apps, the exe might be in a temp location
+            // Use the original executable path
+            if (currentExe.Contains("\\Temp\\") || string.IsNullOrEmpty(currentExe))
+            {
+                currentExe = Environment.GetCommandLineArgs()[0];
+            }
+
+            var uninstallerName = $"Uninstall-{productCode}.exe";
+            var targetPath = Path.Combine(installPath, uninstallerName);
+
+            // Create install directory if it doesn't exist
+            Directory.CreateDirectory(installPath);
+
+            // Copy the current executable as the uninstaller
+            if (File.Exists(currentExe) && currentExe != targetPath)
+            {
+                File.Copy(currentExe, targetPath, overwrite: true);
+                AppendLog($"Copied uninstaller to: {targetPath}");
+            }
+
+            return targetPath;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"WARNING: Could not copy uninstaller: {ex.Message}");
+            // Return a path anyway for registry entry
+            return Path.Combine(installPath, $"Uninstall-{productCode}.exe");
+        }
     }
 
     private void AppendLog(string message)
