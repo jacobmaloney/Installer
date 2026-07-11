@@ -5,11 +5,13 @@ using System.Text.Json.Nodes;
 namespace Installer.Core.Services.Conduit;
 
 /// <summary>
-/// Stamps the Provision: and Enroll: sections into the BASE appsettings.json
-/// (never the environment file — Conduit's SetupService rewrites the env file
-/// wholesale mid-setup and would wipe the stamp). All other content in the
-/// file is preserved. AdminPassword is intentionally never written: Conduit's
-/// ProvisioningService is the single source of truth for generating it.
+/// Merges the Provision: and Enroll: sections into a configuration JSON
+/// document — since the HIGH-2 secrets relocation this is the content of
+/// %PROGRAMDATA%\Conduit\secrets.json (written ACL-first by
+/// <see cref="ConduitSecretsWriter"/>), never the world-readable Program Files
+/// appsettings.json. All other content in the document is preserved.
+/// AdminPassword is intentionally never written: Conduit's ProvisioningService
+/// is the single source of truth for generating it.
 /// </summary>
 public static class ConduitAppSettingsStamper
 {

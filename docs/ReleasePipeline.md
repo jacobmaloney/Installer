@@ -55,8 +55,16 @@ signed/unsigned layouts in `ResourceExtractorTests`.
 
 ## Redist verification (side-by-side SQL Express)
 
-The redist ships next to the installer and runs ELEVATED, so before executing
-it `RedistAuthenticityVerifier` (Installer.Core) requires ONE of:
+The redist ships next to the installer and runs ELEVATED. Before execution:
+
+0. **TOCTOU staging** (`RedistStager`) — the redist is copied into an
+   admin-only staging directory (created ACL-first under the locked-down
+   `%PROGRAMDATA%\Conduit`), and BOTH the verification and the execution run
+   against that protected copy: the bytes checked are the bytes run, with no
+   swap window in the world-writable source location. The staged copy is
+   deleted after setup runs.
+
+Then `RedistAuthenticityVerifier` (Installer.Core) requires ONE of:
 
 1. **Pinned SHA-256** — sidecar `sql.expressSetupSha256`. Exact file match;
    works offline; the sole gate when configured (a mismatch fails hard with no
@@ -64,10 +72,15 @@ it `RedistAuthenticityVerifier` (Installer.Core) requires ONE of:
 2. **Authenticode** (default) — WinVerifyTrust must report a valid embedded
    signature (digest intact, trusted chain, timestamp honored), AND the signer
    subject's **O RDN must equal `Microsoft Corporation`** (parsed RDN, not a
-   substring — CN varies by product and can be crafted), AND the chain must
-   terminate at a Microsoft root CA (`Microsoft Root Certificate Authority*`,
-   `Microsoft Root Authority`, or `Microsoft Identity Verification Root
-   Certificate Authority*`).
+   substring — CN varies by product and can be crafted), AND `X509Chain.Build`
+   must succeed with the chain terminating at a **thumbprint-pinned Microsoft
+   root CA**: Microsoft Root Certificate Authority 2010
+   (`3B1EFD3A66EA28B16697394703A72CA340A05BD5`), 2011
+   (`8F43288AD272F3103B6FB1428485EA3014C0BCFE`), or Microsoft Identity
+   Verification Root Certificate Authority 2020
+   (`F40042E2E5F7E8EF8189FED15519AECE42C3BFA2`). The MD5-era 1997 root is
+   deliberately excluded; a legitimate redist chaining elsewhere is handled by
+   pinning its hash.
 
 Failure = the redist is **not executed**; exit code **33**
 (`SqlRedistVerificationFailed`). Revocation is deliberately not checked

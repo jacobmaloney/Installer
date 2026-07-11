@@ -65,22 +65,26 @@ JSON comments and trailing commas are allowed.
    SQL Express install as dedicated instance **CONDUIT** (Windows auth only,
    TCP/named pipes/Browser disabled — local shared-memory access only,
    `NT AUTHORITY\SYSTEM` sysadmin so the service can create its DB).
-   Never installs over an existing usable instance. Before the redist is
-   executed ELEVATED it must pass the authenticity gate (valid Microsoft
-   Authenticode chain, or the `sql.expressSetupSha256` pin) — the side-by-side
+   Never installs over an existing usable instance. The redist is first COPIED
+   into an admin-only staging directory under `%PROGRAMDATA%\Conduit` (TOCTOU:
+   the bytes verified are the bytes executed), then the STAGED COPY must pass
+   the authenticity gate — valid Microsoft Authenticode signature whose chain
+   terminates at a thumbprint-pinned Microsoft root CA, or the
+   `sql.expressSetupSha256` pin — before it runs elevated; the side-by-side
    file is not covered by the installer exe's own signature. Failure = exit 33,
-   redist never runs.
+   redist never runs. The staged copy is removed afterward.
 3. **Stop existing service** (upgrade), snapshot `appsettings*.json`.
 4. **Extract** the embedded Conduit publish to the install path.
-5. **Stamp the BASE `appsettings.json`** (never the environment file — Conduit's
-   SetupService rewrites that wholesale mid-setup): `Provision:ConnectionString`,
+5. **Lock down `%PROGRAMDATA%\Conduit`** to Administrators + SYSTEM (inheritance
+   cut) **before any secret lands there** — secrets.json and the generated
+   admin password file both live in it.
+6. **Stamp `%PROGRAMDATA%\Conduit\secrets.json`** (ACL-first write; the Program
+   Files `appsettings.json` receives NOTHING secret): `Provision:ConnectionString`,
    optional `AdminUsername`/`ServerPort`, installer-generated `JwtSecretKey`
-   (kept if already stamped), plus `Enroll:Url`/`Enroll:Code`. AdminPassword is
-   never written. On upgrade, the pre-existing `appsettings.Production.json` is
-   restored verbatim.
-6. **Lock down `%PROGRAMDATA%\Conduit`** to Administrators + SYSTEM (inheritance
-   cut) **before** first service start — the generated admin password file
-   lands there.
+   (kept if already present — including a legacy base-file stamp on upgrade),
+   plus `Enroll:Url`/`Enroll:Code`. AdminPassword is never written. On upgrade,
+   the pre-existing `appsettings.Production.json` is restored verbatim (any
+   secrets in it self-relocate into secrets.json on Conduit's next boot).
 7. **Register the "Conduit" event-log source** (needs elevation; the service
    account cannot create it at runtime).
 8. **Service:** `sc create` (or `sc config` on upgrade) `binPath=<installPath>\Conduit.Web.exe`,
@@ -126,12 +130,20 @@ JSON comments and trailing commas are allowed.
   SYSTEM is sysadmin via setup; on a reused existing instance, the installer
   grants SYSTEM `dbcreator` only (flag: `sql.grantServiceAccess`). A dedicated
   low-privilege service account is the GA hardening follow-up.
-- **Redist authenticity gate** — the SQL Express setup exe ships side-by-side
-  and is outside the installer's Authenticode coverage, so
-  `RedistAuthenticityVerifier` refuses to run it elevated unless it matches the
-  configured SHA-256 pin or carries a valid Microsoft Authenticode signature
-  (parsed O RDN + Microsoft root CA). See `docs/ReleasePipeline.md` for the
-  full signing/verification contract.
+- **Redist authenticity gate + TOCTOU staging** — the SQL Express setup exe
+  ships side-by-side and is outside the installer's Authenticode coverage, so
+  it is copied into an admin-only staging directory (`RedistStager`) and the
+  STAGED copy must pass `RedistAuthenticityVerifier` before it runs elevated:
+  the configured SHA-256 pin, or a valid Microsoft Authenticode signature
+  (parsed O RDN, `chain.Build()` honored, root pinned by SHA-1 thumbprint to
+  the Microsoft 2010/2011/Identity-Verification-2020 roots). See
+  `docs/ReleasePipeline.md` for the full signing/verification contract.
+- **Secrets live in `%PROGRAMDATA%\Conduit\secrets.json`** (HIGH-2) — the
+  installer stamps Provision/Enroll there ACL-first via a hand-mirrored
+  `RestrictedFileWriter` (source of truth: Conduit repo,
+  `src/Conduit.Sync/Security/RestrictedFileWriter.cs`); Conduit loads the file
+  last so it outranks appsettings, and self-relocates any legacy plaintext
+  secrets out of Program Files at boot (`SecretsRelocator`).
 - **No Programs-and-Features registration yet** — the existing UninstallWindow
   is IIS/IdentityCenter-shaped; registering an uninstall entry that runs the
   wrong engine would be worse than none. Follow-up item.

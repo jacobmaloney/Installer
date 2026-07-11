@@ -38,15 +38,17 @@ public class RedistAuthenticityVerifier
     private const string ExpectedSignerOrganization = "Microsoft Corporation";
 
     /// <summary>
-    /// Root CA subject fragments accepted for the redist chain. Covers the
-    /// classic Microsoft code-signing roots (2001/2010/2011) and the newer
-    /// identity-verification root Azure Trusted Signing chains to.
+    /// Pinned Microsoft root CAs, by SHA-1 certificate thumbprint (not subject
+    /// text, which an attacker-controlled trusted root could imitate). Values
+    /// verified against the Windows trusted root store. Deliberately excludes
+    /// the MD5-era 1997 "Microsoft Root Authority" root. A legitimate redist
+    /// chaining elsewhere is handled by pinning its hash (sql.expressSetupSha256).
     /// </summary>
-    private static readonly string[] AcceptedRootSubjectFragments =
+    private static readonly string[] AcceptedRootThumbprints =
     {
-        "Microsoft Root Certificate Authority",
-        "Microsoft Root Authority",
-        "Microsoft Identity Verification Root Certificate Authority"
+        "3B1EFD3A66EA28B16697394703A72CA340A05BD5", // CN=Microsoft Root Certificate Authority 2010
+        "8F43288AD272F3103B6FB1428485EA3014C0BCFE", // CN=Microsoft Root Certificate Authority 2011
+        "F40042E2E5F7E8EF8189FED15519AECE42C3BFA2"  // CN=Microsoft Identity Verification Root Certificate Authority 2020 (Azure Trusted Signing)
     };
 
     /// <summary>Returns null when the file is safe to execute, else the reason to refuse.</summary>
@@ -160,19 +162,26 @@ public class RedistAuthenticityVerifier
 
         using var chain = new X509Chain();
         // Trust was already established by WinVerifyTrust (with timestamp
-        // semantics); this build only walks to the root, so ignore time validity
+        // semantics); this build identifies the root, so ignore time validity
         // (redist signing certs age out while the timestamped signature stays valid).
         chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
         chain.ChainPolicy.VerificationFlags =
             X509VerificationFlags.IgnoreNotTimeValid | X509VerificationFlags.IgnoreCtlNotTimeValid;
-        chain.Build(signer);
+
+        if (!chain.Build(signer))
+        {
+            var statuses = string.Join("; ", chain.ChainStatus
+                .Select(s => s.StatusInformation.Trim())
+                .Where(s => s.Length > 0));
+            return $"the certificate chain could not be validated ({(statuses.Length > 0 ? statuses : "unknown chain error")}).";
+        }
 
         if (chain.ChainElements.Count == 0)
             return "the certificate chain could not be built.";
 
         var root = chain.ChainElements[^1].Certificate;
-        if (!AcceptedRootSubjectFragments.Any(f => root.Subject.Contains(f, StringComparison.OrdinalIgnoreCase)))
-            return $"the chain terminates at '{root.Subject}', which is not a Microsoft root CA.";
+        if (!AcceptedRootThumbprints.Contains(root.Thumbprint, StringComparer.OrdinalIgnoreCase))
+            return $"the chain terminates at '{root.Subject}' (thumbprint {root.Thumbprint}), which is not a pinned Microsoft root CA.";
 
         return null;
     }

@@ -4,11 +4,12 @@ namespace Installer.Core.Services.Conduit;
 
 /// <summary>
 /// Unattended Conduit install orchestrator. Sequence:
-/// preflight → resolve SQL (detect / skip / bootstrap Express) → stop existing
-/// service → extract payload → stamp BASE appsettings.json → lock down
-/// %PROGRAMDATA%\Conduit ACL (before first service start — the generated admin
-/// password lands there) → register event-log source → create/start the
-/// Windows service → poll enroll-status.json for the enrollment outcome.
+/// preflight → resolve SQL (detect / skip / bootstrap Express from a verified,
+/// staged copy) → stop existing service → extract payload → lock down
+/// %PROGRAMDATA%\Conduit ACL (BEFORE any secret lands there) → stamp Provision +
+/// Enroll into the restricted secrets.json (the Program Files appsettings.json
+/// gets nothing secret) → register event-log source → create/start the Windows
+/// service → poll enroll-status.json for the enrollment outcome.
 /// Every failure class maps to a distinct <see cref="SilentExitCode"/>.
 /// </summary>
 public class ConduitSilentInstaller
@@ -19,6 +20,8 @@ public class ConduitSilentInstaller
     private readonly ConduitServiceInstaller _serviceInstaller;
     private readonly ResourceExtractor _extractor;
     private readonly RedistAuthenticityVerifier _redistVerifier;
+    private readonly RedistStager _redistStager;
+    private readonly ConduitSecretsWriter _secretsWriter;
 
     public ConduitSilentInstaller(
         ConduitPreflight? preflight = null,
@@ -26,7 +29,9 @@ public class ConduitSilentInstaller
         SqlExpressBootstrapper? sqlBootstrapper = null,
         ConduitServiceInstaller? serviceInstaller = null,
         ResourceExtractor? extractor = null,
-        RedistAuthenticityVerifier? redistVerifier = null)
+        RedistAuthenticityVerifier? redistVerifier = null,
+        RedistStager? redistStager = null,
+        ConduitSecretsWriter? secretsWriter = null)
     {
         _preflight = preflight ?? new ConduitPreflight();
         _sqlDetector = sqlDetector ?? new SqlInstanceDetector();
@@ -34,6 +39,8 @@ public class ConduitSilentInstaller
         _serviceInstaller = serviceInstaller ?? new ConduitServiceInstaller();
         _extractor = extractor ?? new ResourceExtractor();
         _redistVerifier = redistVerifier ?? new RedistAuthenticityVerifier();
+        _redistStager = redistStager ?? new RedistStager();
+        _secretsWriter = secretsWriter ?? new ConduitSecretsWriter();
     }
 
     public async Task<SilentExitCode> RunAsync(ConduitInstallOptions options, string installerDirectory, SilentInstallLog log)
@@ -113,40 +120,47 @@ public class ConduitSilentInstaller
             return SilentExitCode.ExtractFailed;
         }
 
-        // ── 4. Stamp BASE appsettings.json (+ restore env file on upgrade) ──
-        try
-        {
-            var existingJson = preUpgradeBaseSettings ?? TryReadFile(baseSettingsPath);
-            var stamped = ConduitAppSettingsStamper.Stamp(
-                existingJson,
-                connectionString!,
-                options.EnrollUrl,
-                options.EnrollCode,
-                options.AdminUsername,
-                options.ServerPort);
-            await File.WriteAllTextAsync(baseSettingsPath, stamped);
-            log.Info("Stamped Provision + Enroll sections into appsettings.json (base file).");
-
-            if (preUpgradeProductionSettings != null)
-            {
-                await File.WriteAllTextAsync(productionSettingsPath, preUpgradeProductionSettings);
-                log.Info("Restored pre-upgrade appsettings.Production.json (owned by Conduit's setup).");
-            }
-        }
-        catch (Exception ex)
-        {
-            log.Error($"Could not stamp appsettings.json: {ex.Message}");
-            return SilentExitCode.ConfigStampFailed;
-        }
-
-        // ── 5. Lock down the data directory BEFORE first service start ──
+        // ── 4. Lock down the data directory BEFORE any secret lands in it ──
         var aclError = ConduitDataDirectorySecurer.Secure();
         if (aclError != null)
         {
-            log.Error($"{aclError} Refusing to continue — the generated admin password would be world-readable.");
+            log.Error($"{aclError} Refusing to continue — secrets.json and the generated admin password would be world-readable.");
             return SilentExitCode.DataDirAclFailed;
         }
         log.Info(@"Locked %PROGRAMDATA%\Conduit to Administrators + SYSTEM.");
+
+        // ── 5. Stamp secrets.json (+ restore env file on upgrade) ──────────
+        // The Program Files appsettings.json is left exactly as the payload
+        // shipped it — the installer writes NOTHING secret outside the locked
+        // data directory. A pre-secrets-era upgrade's Provision:JwtSecretKey
+        // (old base-file stamp) is carried over so tokens survive the upgrade.
+        var stampError = _secretsWriter.StampProvisionAndEnroll(
+            connectionString!,
+            options.EnrollUrl,
+            options.EnrollCode,
+            options.AdminUsername,
+            options.ServerPort,
+            preUpgradeBaseSettings,
+            log);
+        if (stampError != null)
+        {
+            log.Error(stampError);
+            return SilentExitCode.ConfigStampFailed;
+        }
+
+        if (preUpgradeProductionSettings != null)
+        {
+            try
+            {
+                await File.WriteAllTextAsync(productionSettingsPath, preUpgradeProductionSettings);
+                log.Info("Restored pre-upgrade appsettings.Production.json (owned by Conduit's setup; its secrets self-relocate on Conduit's next boot).");
+            }
+            catch (Exception ex)
+            {
+                log.Error($"Could not restore appsettings.Production.json: {ex.Message}");
+                return SilentExitCode.ConfigStampFailed;
+            }
+        }
 
         // ── 6. Event-log source ─────────────────────────────────────────
         var eventLogError = _serviceInstaller.RegisterEventLogSource();
@@ -177,7 +191,7 @@ public class ConduitSilentInstaller
         var startError = _serviceInstaller.Start(options.ServiceName);
         if (startError != null)
         {
-            log.Error($"{startError} Check the Application event log and {baseSettingsPath}.");
+            log.Error($"{startError} Check the Application event log and {_secretsWriter.SecretsPath}.");
             return SilentExitCode.ServiceStartFailed;
         }
         log.Info("Service is running.");
@@ -247,21 +261,39 @@ public class ConduitSilentInstaller
             return (null, SilentExitCode.SqlNoUsableInstance);
         }
 
-        // The redist sits OUTSIDE the installer exe's Authenticode coverage
-        // (side-by-side file) and is about to run elevated — it must prove it
-        // is Microsoft's binary (or match the configured pin) first.
-        var verifyError = _redistVerifier.Verify(setupExe, options.Sql.ExpressSetupSha256, log);
-        if (verifyError != null)
+        // TOCTOU closure: copy the redist into an admin-only staging directory
+        // FIRST, then verify THAT copy and execute THAT copy — the bytes checked
+        // are the bytes run; no swap window in the world-writable source location
+        // between the check and the elevated launch.
+        var stagedSetupExe = _redistStager.Stage(setupExe, log, out var stageError);
+        if (stagedSetupExe == null)
         {
-            log.Error(verifyError);
+            log.Error(stageError!);
             return (null, SilentExitCode.SqlRedistVerificationFailed);
         }
 
-        var installErrorText = _sqlBootstrapper.Install(setupExe, log);
-        if (installErrorText != null)
+        try
         {
-            log.Error(installErrorText);
-            return (null, SilentExitCode.SqlExpressInstallFailed);
+            // The redist sits OUTSIDE the installer exe's Authenticode coverage
+            // (side-by-side file) and is about to run elevated — it must prove it
+            // is Microsoft's binary (or match the configured pin) first.
+            var verifyError = _redistVerifier.Verify(stagedSetupExe, options.Sql.ExpressSetupSha256, log);
+            if (verifyError != null)
+            {
+                log.Error(verifyError);
+                return (null, SilentExitCode.SqlRedistVerificationFailed);
+            }
+
+            var installErrorText = _sqlBootstrapper.Install(stagedSetupExe, log);
+            if (installErrorText != null)
+            {
+                log.Error(installErrorText);
+                return (null, SilentExitCode.SqlExpressInstallFailed);
+            }
+        }
+        finally
+        {
+            _redistStager.Cleanup();
         }
 
         var conduitServer = SqlInstanceDetector.BuildServerName(SqlExpressBootstrapper.ConduitInstanceName);
