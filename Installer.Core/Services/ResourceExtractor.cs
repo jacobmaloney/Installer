@@ -64,7 +64,7 @@ public class ResourceExtractor
                     if (string.IsNullOrEmpty(entry.Name))
                         continue;
 
-                    var destinationPath = Path.Combine(targetDirectory, entry.FullName);
+                    var destinationPath = ResolveDestinationPath(targetDirectory, entry.FullName);
 
                     // Create directory if needed
                     var destinationDir = Path.GetDirectoryName(destinationPath);
@@ -87,6 +87,26 @@ public class ResourceExtractor
         }
 
         return filesExtracted;
+    }
+
+    /// <summary>
+    /// Resolves a zip entry's destination path, rejecting entries that would
+    /// escape the target directory (zip-slip: "..\..\evil", rooted paths).
+    /// </summary>
+    public static string ResolveDestinationPath(string targetDirectory, string entryFullName)
+    {
+        var root = Path.GetFullPath(targetDirectory);
+        var destination = Path.GetFullPath(Path.Combine(root, entryFullName));
+
+        var rootWithSeparator = root.EndsWith(Path.DirectorySeparatorChar) || root.EndsWith(Path.AltDirectorySeparatorChar)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+
+        if (!destination.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException(
+                $"Zip entry '{entryFullName}' resolves outside the target directory and was rejected.");
+
+        return destination;
     }
 
     /// <summary>

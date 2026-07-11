@@ -1,0 +1,41 @@
+{
+  // Rename this file to conduit.provision.json (next to ConduitSetup.exe) or
+  // pass it via: ConduitSetup.exe --silent --config <path>
+  // Comments and trailing commas are allowed.
+
+  // REQUIRED — enrollment target and single-use code (15-minute TTL) from the
+  // IdentityCenter platform. Generate the code right before running the install.
+  "enrollUrl": "https://platform.certification-center.com",
+  "enrollCode": "PASTE-FRESH-CODE-HERE",
+
+  // Informational label for the install log.
+  "tenantSlug": "acme",
+
+  // REQUIRED — "on-prem" (AD sync; host must be domain-joined) or "cloud-only".
+  "mode": "on-prem",
+
+  // Optional overrides (defaults shown).
+  "installPath": "C:\\Program Files\\Conduit",
+  "serviceName": "IdentityCenterConduit",
+  // "serverPort": 5500,
+  // "adminUsername": "admin",
+
+  "sql": {
+    // Supply a full connection string to use a specific server (skips detection
+    // and the SQL Express bootstrap entirely). LocalDB is not supported.
+    // "connectionString": "Server=sql01.corp.example.com;Database=Conduit;Integrated Security=True;TrustServerCertificate=True",
+
+    // Prefer a specific existing local instance during detection.
+    // "instanceName": "SQLEXPRESS",
+
+    "database": "Conduit",
+
+    // When no usable local instance exists, silently install the bundled SQL
+    // Express (redist\SQLEXPR_x64_ENU.exe) as instance CONDUIT. Never installs
+    // over an existing usable instance.
+    "allowExpressInstall": true
+
+    // "expressSetupPath": "D:\\redist\\SQLEXPR_x64_ENU.exe",
+    // "grantServiceAccess": true
+  }
+}

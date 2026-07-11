@@ -1,0 +1,277 @@
+using Installer.Core.Models;
+
+namespace Installer.Core.Services.Conduit;
+
+/// <summary>
+/// Unattended Conduit install orchestrator. Sequence:
+/// preflight → resolve SQL (detect / skip / bootstrap Express) → stop existing
+/// service → extract payload → stamp BASE appsettings.json → lock down
+/// %PROGRAMDATA%\Conduit ACL (before first service start — the generated admin
+/// password lands there) → register event-log source → create/start the
+/// Windows service → poll enroll-status.json for the enrollment outcome.
+/// Every failure class maps to a distinct <see cref="SilentExitCode"/>.
+/// </summary>
+public class ConduitSilentInstaller
+{
+    private readonly ConduitPreflight _preflight;
+    private readonly SqlInstanceDetector _sqlDetector;
+    private readonly SqlExpressBootstrapper _sqlBootstrapper;
+    private readonly ConduitServiceInstaller _serviceInstaller;
+    private readonly ResourceExtractor _extractor;
+
+    public ConduitSilentInstaller(
+        ConduitPreflight? preflight = null,
+        SqlInstanceDetector? sqlDetector = null,
+        SqlExpressBootstrapper? sqlBootstrapper = null,
+        ConduitServiceInstaller? serviceInstaller = null,
+        ResourceExtractor? extractor = null)
+    {
+        _preflight = preflight ?? new ConduitPreflight();
+        _sqlDetector = sqlDetector ?? new SqlInstanceDetector();
+        _sqlBootstrapper = sqlBootstrapper ?? new SqlExpressBootstrapper();
+        _serviceInstaller = serviceInstaller ?? new ConduitServiceInstaller();
+        _extractor = extractor ?? new ResourceExtractor();
+    }
+
+    public async Task<SilentExitCode> RunAsync(ConduitInstallOptions options, string installerDirectory, SilentInstallLog log)
+    {
+        log.Info($"Conduit unattended install starting. Mode: {options.Mode}. Install path: {options.InstallPath}." +
+                 (string.IsNullOrWhiteSpace(options.TenantSlug) ? "" : $" Tenant: {options.TenantSlug}."));
+
+        // ── 1. Preflight ────────────────────────────────────────────────
+        if (!_preflight.IsElevated())
+        {
+            log.Error("Not running elevated. Run the installer as Administrator (the exe manifest requests elevation; RMM tools must launch it with an admin token).");
+            return SilentExitCode.PreflightNotElevated;
+        }
+        log.Info("Preflight: elevation OK.");
+
+        if (options.Mode == ConduitInstallOptions.ModeOnPrem)
+        {
+            if (!_preflight.IsDomainJoined())
+            {
+                log.Error("Preflight: this host is not domain-joined. Mode 'on-prem' requires a domain-joined host for Active Directory sync. " +
+                          "Use mode 'cloud-only' if this Conduit will only sync cloud sources.");
+                return SilentExitCode.PreflightNotDomainJoined;
+            }
+            log.Info("Preflight: domain-joined OK.");
+        }
+        else
+        {
+            log.Info("Preflight: domain check skipped (cloud-only mode).");
+        }
+
+        if (!_preflight.IsAspNetCore8RuntimeInstalled(out var runtimeVersion))
+        {
+            log.Error("Preflight: ASP.NET Core Runtime 8.x (x64) is not installed and the Conduit payload requires it. " +
+                      "Install the 'ASP.NET Core Runtime 8 – Windows x64' package from dotnet.microsoft.com and re-run.");
+            return SilentExitCode.PreflightRuntimeMissing;
+        }
+        log.Info($"Preflight: ASP.NET Core runtime {runtimeVersion} found.");
+
+        var probe = await _preflight.ProbeEnrollHostAsync(options.EnrollUrl);
+        if (!probe.Success)
+        {
+            log.Error($"Preflight: cannot reach the enrollment host. {probe.Message}");
+            return SilentExitCode.PreflightNetworkFailed;
+        }
+        log.Info($"Preflight: {probe.Message}");
+        log.Info("Note: the enroll code itself cannot be validated before use (codes are single-use); a stale code will surface as an enrollment failure after service start.");
+
+        // ── 2. Resolve SQL ──────────────────────────────────────────────
+        var (connectionString, sqlExit) = ResolveSqlConnection(options, installerDirectory, log);
+        if (sqlExit != SilentExitCode.Success)
+            return sqlExit;
+
+        // ── 3. Stop existing service (upgrade) + extract payload ───────
+        var stopError = _serviceInstaller.StopIfRunning(options.ServiceName);
+        if (stopError != null)
+        {
+            log.Error($"{stopError} Files would be locked during extraction.");
+            return SilentExitCode.ExtractFailed;
+        }
+
+        var baseSettingsPath = Path.Combine(options.InstallPath, "appsettings.json");
+        var productionSettingsPath = Path.Combine(options.InstallPath, "appsettings.Production.json");
+        string? preUpgradeBaseSettings = TryReadFile(baseSettingsPath);
+        string? preUpgradeProductionSettings = TryReadFile(productionSettingsPath);
+        if (preUpgradeBaseSettings != null)
+            log.Info("Existing installation detected — preserving appsettings content across the upgrade.");
+
+        try
+        {
+            log.Info($"Extracting application payload to {options.InstallPath}...");
+            var fileCount = await _extractor.ExtractEmbeddedFilesAsync(options.InstallPath);
+            log.Info($"Extracted {fileCount} files.");
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Payload extraction failed: {ex.Message}");
+            return SilentExitCode.ExtractFailed;
+        }
+
+        // ── 4. Stamp BASE appsettings.json (+ restore env file on upgrade) ──
+        try
+        {
+            var existingJson = preUpgradeBaseSettings ?? TryReadFile(baseSettingsPath);
+            var stamped = ConduitAppSettingsStamper.Stamp(
+                existingJson,
+                connectionString!,
+                options.EnrollUrl,
+                options.EnrollCode,
+                options.AdminUsername,
+                options.ServerPort);
+            await File.WriteAllTextAsync(baseSettingsPath, stamped);
+            log.Info("Stamped Provision + Enroll sections into appsettings.json (base file).");
+
+            if (preUpgradeProductionSettings != null)
+            {
+                await File.WriteAllTextAsync(productionSettingsPath, preUpgradeProductionSettings);
+                log.Info("Restored pre-upgrade appsettings.Production.json (owned by Conduit's setup).");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error($"Could not stamp appsettings.json: {ex.Message}");
+            return SilentExitCode.ConfigStampFailed;
+        }
+
+        // ── 5. Lock down the data directory BEFORE first service start ──
+        var aclError = ConduitDataDirectorySecurer.Secure();
+        if (aclError != null)
+        {
+            log.Error($"{aclError} Refusing to continue — the generated admin password would be world-readable.");
+            return SilentExitCode.DataDirAclFailed;
+        }
+        log.Info(@"Locked %PROGRAMDATA%\Conduit to Administrators + SYSTEM.");
+
+        // ── 6. Event-log source ─────────────────────────────────────────
+        var eventLogError = _serviceInstaller.RegisterEventLogSource();
+        if (eventLogError != null)
+        {
+            log.Error(eventLogError);
+            return SilentExitCode.EventLogSourceFailed;
+        }
+        log.Info("Registered Windows event-log source 'Conduit'.");
+
+        // ── 7. Windows service ──────────────────────────────────────────
+        var exePath = Path.Combine(options.InstallPath, "Conduit.Web.exe");
+        if (!File.Exists(exePath))
+        {
+            log.Error($"Expected service executable not found after extraction: {exePath}. Was the payload built with a Windows folder publish of Conduit.Web?");
+            return SilentExitCode.ServiceInstallFailed;
+        }
+
+        var installError = _serviceInstaller.CreateOrUpdate(options.ServiceName, exePath, log);
+        if (installError != null)
+        {
+            log.Error(installError);
+            return SilentExitCode.ServiceInstallFailed;
+        }
+
+        var enrollBaselineUtc = DateTime.UtcNow;
+        log.Info($"Starting service '{options.ServiceName}' (first start runs database initialization — this can take a few minutes)...");
+        var startError = _serviceInstaller.Start(options.ServiceName);
+        if (startError != null)
+        {
+            log.Error($"{startError} Check the Application event log and {baseSettingsPath}.");
+            return SilentExitCode.ServiceStartFailed;
+        }
+        log.Info("Service is running.");
+
+        // ── 8. Enrollment outcome ───────────────────────────────────────
+        var exitCode = await EnrollStatusReader.PollAsync(enrollBaselineUtc, log);
+
+        if (exitCode is SilentExitCode.Success or SilentExitCode.SuccessEnrollPending)
+            log.Info($"Install complete. Admin credentials (if generated) are in {Path.Combine(ConduitDataDirectorySecurer.DefaultDataDirectory, "admin-initial-password.txt")} — sign in, change the password, delete the file.");
+
+        return exitCode;
+    }
+
+    /// <summary>
+    /// SQL resolution: explicit connection string wins; else first usable local
+    /// instance (preference-ordered); else bootstrap the bundled SQL Express.
+    /// Never force-installs over a usable existing instance.
+    /// </summary>
+    private (string? ConnectionString, SilentExitCode Exit) ResolveSqlConnection(
+        ConduitInstallOptions options, string installerDirectory, SilentInstallLog log)
+    {
+        if (!string.IsNullOrWhiteSpace(options.Sql.ConnectionString))
+        {
+            log.Info("Using the connection string supplied in the sidecar (detection and Express bootstrap skipped).");
+            return (options.Sql.ConnectionString, SilentExitCode.Success);
+        }
+
+        var detected = _sqlDetector.GetInstalledInstanceNames();
+        var ordered = SqlInstanceDetector.OrderByPreference(detected, options.Sql.InstanceName);
+        log.Info(ordered.Count == 0
+            ? "SQL detection: no local SQL Server instances found."
+            : $"SQL detection: local instances found: {string.Join(", ", ordered)}.");
+
+        foreach (var instance in ordered)
+        {
+            var server = SqlInstanceDetector.BuildServerName(instance);
+            var connectError = _sqlDetector.TestConnect(server);
+            if (connectError == null)
+            {
+                log.Info($"Using existing SQL instance '{instance}' ({server}). SQL Express bootstrap skipped.");
+
+                if (options.Sql.GrantServiceAccess)
+                {
+                    var grantError = _sqlBootstrapper.GrantServiceAccess(server);
+                    if (grantError != null)
+                        log.Warn($"Could not grant NT AUTHORITY\\SYSTEM dbcreator on '{server}': {grantError}. " +
+                                 "If the Conduit service cannot create its database, grant access manually or supply sql.connectionString.");
+                    else
+                        log.Info(@"Granted NT AUTHORITY\SYSTEM dbcreator on the existing instance (service runs as LocalSystem).");
+                }
+
+                return (SqlExpressBootstrapper.BuildConnectionString(server, options.Sql.Database), SilentExitCode.Success);
+            }
+            log.Warn($"Instance '{instance}' is not usable: {connectError}");
+        }
+
+        if (!options.Sql.AllowExpressInstall)
+        {
+            log.Error("No usable SQL instance found and sql.allowExpressInstall is false. Supply sql.connectionString or enable the Express bootstrap.");
+            return (null, SilentExitCode.SqlNoUsableInstance);
+        }
+
+        var setupExe = SqlExpressBootstrapper.FindSetupExecutable(installerDirectory, options.Sql.ExpressSetupPath);
+        if (setupExe == null)
+        {
+            log.Error(@"No usable SQL instance found and the SQL Express setup exe is missing (expected redist\SQLEXPR*.exe next to the installer, or sql.expressSetupPath).");
+            return (null, SilentExitCode.SqlNoUsableInstance);
+        }
+
+        var installErrorText = _sqlBootstrapper.Install(setupExe, log);
+        if (installErrorText != null)
+        {
+            log.Error(installErrorText);
+            return (null, SilentExitCode.SqlExpressInstallFailed);
+        }
+
+        var conduitServer = SqlInstanceDetector.BuildServerName(SqlExpressBootstrapper.ConduitInstanceName);
+        var postInstallConnectError = _sqlDetector.TestConnect(conduitServer, timeoutSeconds: 15);
+        if (postInstallConnectError != null)
+        {
+            log.Error($"SQL Express installed but connection to {conduitServer} failed: {postInstallConnectError}");
+            return (null, SilentExitCode.SqlConnectFailed);
+        }
+
+        log.Info($"SQL Express instance {conduitServer} is up.");
+        return (SqlExpressBootstrapper.BuildConnectionString(conduitServer, options.Sql.Database), SilentExitCode.Success);
+    }
+
+    private static string? TryReadFile(string path)
+    {
+        try
+        {
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}

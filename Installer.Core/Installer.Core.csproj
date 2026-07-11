@@ -5,8 +5,10 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <!-- Suppress platform compatibility warnings - this is intentionally Windows-only -->
-    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <!-- Suppress platform compatibility warnings - this is intentionally Windows-only.
+         NU1605 matches InstallerRuntime's suppression: Microsoft.Web.Administration's old
+         NETStandard graph reports downgrades during RID-specific (win-x64 publish) restore. -->
+    <NoWarn>$(NoWarn);CA1416;NU1605</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,6 +16,8 @@
     <PackageReference Include="Microsoft.Build.Locator" Version="1.10.2" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.0" />
     <PackageReference Include="Microsoft.Web.Administration" Version="11.1.0" />
+    <PackageReference Include="System.Diagnostics.EventLog" Version="9.0.0" />
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
   </ItemGroup>
 
 </Project>

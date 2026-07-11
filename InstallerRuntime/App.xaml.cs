@@ -20,6 +20,13 @@ public partial class App : System.Windows.Application
     /// </summary>
     public static string? UninstallProductCode { get; private set; }
 
+    /// <summary>
+    /// True when running the no-UI unattended Conduit install (--silent /
+    /// conduit.provision.json sidecar). No windows, no message boxes; the
+    /// process exit code reports the outcome.
+    /// </summary>
+    public static bool IsSilentMode { get; private set; }
+
     protected override void OnStartup(StartupEventArgs e)
     {
         // Global exception handlers to catch any unhandled errors
@@ -43,6 +50,24 @@ public partial class App : System.Windows.Application
 
         // Parse command line arguments
         ParseCommandLineArgs(e.Args);
+
+        // Silent unattended Conduit install: no windows, exit code is the result.
+        // Explicit /uninstall always wins over a sidecar sitting next to the exe.
+        var installerDirectory = System.IO.Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
+        var silentInvocation = Installer.Core.Services.Conduit.ConduitSilentInvocation.Resolve(e.Args, installerDirectory);
+        if (silentInvocation.IsSilent && !IsUninstallMode)
+        {
+            IsSilentMode = true;
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            base.OnStartup(e);
+
+            Task.Run(async () =>
+            {
+                var exitCode = await SilentInstall.RunAsync(silentInvocation.ConfigPath);
+                Dispatcher.Invoke(() => Shutdown(exitCode));
+            });
+            return;
+        }
 
         try
         {
@@ -101,6 +126,9 @@ public partial class App : System.Windows.Application
             File.WriteAllText(logPath, $"{title}\n\n{message}");
         }
         catch { }
+
+        if (IsSilentMode)
+            return;
 
         System.Windows.MessageBox.Show(message, $"Installer Error: {title}",
             MessageBoxButton.OK, MessageBoxImage.Error);
