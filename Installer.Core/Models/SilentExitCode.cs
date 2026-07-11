@@ -30,6 +30,8 @@ public enum SilentExitCode
     SqlNoUsableInstance = 30,
     SqlExpressInstallFailed = 31,
     SqlConnectFailed = 32,
+    /// <summary>The SQL Express redist failed the authenticity gate (Microsoft Authenticode chain / pinned SHA-256) and was NOT executed.</summary>
+    SqlRedistVerificationFailed = 33,
 
     // 40-49: payload
     ExtractFailed = 40,

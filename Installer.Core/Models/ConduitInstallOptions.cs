@@ -90,6 +90,10 @@ public class ConduitInstallOptions
         if (string.IsNullOrWhiteSpace(Sql.Database))
             errors.Add("sql.database must not be blank.");
 
+        if (!string.IsNullOrWhiteSpace(Sql.ExpressSetupSha256) &&
+            !Services.Conduit.RedistAuthenticityVerifier.TryNormalizeSha256Pin(Sql.ExpressSetupSha256, out _))
+            errors.Add($"sql.expressSetupSha256 must be a 64-character hex SHA-256 (got '{Sql.ExpressSetupSha256}').");
+
         return errors;
     }
 }
@@ -114,6 +118,14 @@ public class ConduitSqlOptions
     /// <summary>Override path to the SQL Express setup exe. Default: redist\SQLEXPR*.exe next to the installer.</summary>
     [JsonPropertyName("expressSetupPath")]
     public string? ExpressSetupPath { get; set; }
+
+    /// <summary>
+    /// Optional pinned SHA-256 of the SQL Express setup exe. When set, the redist must match
+    /// this hash exactly before it is executed elevated (replaces the default check that its
+    /// Authenticode signature is valid and chains to a Microsoft root CA).
+    /// </summary>
+    [JsonPropertyName("expressSetupSha256")]
+    public string? ExpressSetupSha256 { get; set; }
 
     /// <summary>
     /// When reusing an EXISTING instance, grant NT AUTHORITY\SYSTEM a login + dbcreator so the

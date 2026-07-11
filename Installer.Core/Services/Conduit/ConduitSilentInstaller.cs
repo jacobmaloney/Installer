@@ -18,19 +18,22 @@ public class ConduitSilentInstaller
     private readonly SqlExpressBootstrapper _sqlBootstrapper;
     private readonly ConduitServiceInstaller _serviceInstaller;
     private readonly ResourceExtractor _extractor;
+    private readonly RedistAuthenticityVerifier _redistVerifier;
 
     public ConduitSilentInstaller(
         ConduitPreflight? preflight = null,
         SqlInstanceDetector? sqlDetector = null,
         SqlExpressBootstrapper? sqlBootstrapper = null,
         ConduitServiceInstaller? serviceInstaller = null,
-        ResourceExtractor? extractor = null)
+        ResourceExtractor? extractor = null,
+        RedistAuthenticityVerifier? redistVerifier = null)
     {
         _preflight = preflight ?? new ConduitPreflight();
         _sqlDetector = sqlDetector ?? new SqlInstanceDetector();
         _sqlBootstrapper = sqlBootstrapper ?? new SqlExpressBootstrapper();
         _serviceInstaller = serviceInstaller ?? new ConduitServiceInstaller();
         _extractor = extractor ?? new ResourceExtractor();
+        _redistVerifier = redistVerifier ?? new RedistAuthenticityVerifier();
     }
 
     public async Task<SilentExitCode> RunAsync(ConduitInstallOptions options, string installerDirectory, SilentInstallLog log)
@@ -242,6 +245,16 @@ public class ConduitSilentInstaller
         {
             log.Error(@"No usable SQL instance found and the SQL Express setup exe is missing (expected redist\SQLEXPR*.exe next to the installer, or sql.expressSetupPath).");
             return (null, SilentExitCode.SqlNoUsableInstance);
+        }
+
+        // The redist sits OUTSIDE the installer exe's Authenticode coverage
+        // (side-by-side file) and is about to run elevated — it must prove it
+        // is Microsoft's binary (or match the configured pin) first.
+        var verifyError = _redistVerifier.Verify(setupExe, options.Sql.ExpressSetupSha256, log);
+        if (verifyError != null)
+        {
+            log.Error(verifyError);
+            return (null, SilentExitCode.SqlRedistVerificationFailed);
         }
 
         var installErrorText = _sqlBootstrapper.Install(setupExe, log);

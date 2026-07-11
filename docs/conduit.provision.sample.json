@@ -36,6 +36,12 @@
     "allowExpressInstall": true
 
     // "expressSetupPath": "D:\\redist\\SQLEXPR_x64_ENU.exe",
+
+    // Optional pinned SHA-256 for the SQL Express setup exe (Get-FileHash output
+    // accepted). When set, the file must match exactly before it runs elevated.
+    // When unset, the redist must carry a valid Microsoft Authenticode signature.
+    // "expressSetupSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+
     // "grantServiceAccess": true
   }
 }

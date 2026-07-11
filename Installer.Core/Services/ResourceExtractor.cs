@@ -110,60 +110,167 @@ public class ResourceExtractor
     }
 
     /// <summary>
-    /// Extracts the ZIP data appended to the end of the EXE
-    /// Format: [EXE][MARKER:8][ZIP:N][SIZE:4][MARKER:8]
+    /// Extracts the ZIP data appended to the EXE.
+    /// Format: [EXE][MARKER:8][ZIP:N][SIZE:4][MARKER:8], optionally followed by
+    /// zero padding + the Authenticode certificate table when the exe was
+    /// signed AFTER embedding (the required order — the signature then covers
+    /// the payload).
     /// </summary>
     private async Task<Stream?> ExtractAppendedZipAsync(string exePath)
     {
         try
         {
-            using (var exeStream = File.OpenRead(exePath))
+            using var exeStream = File.OpenRead(exePath);
+            var trailer = LocateTrailer(exeStream);
+            if (trailer == null)
+                return null;
+
+            exeStream.Seek(trailer.Value.ZipStart, SeekOrigin.Begin);
+            var zipData = new byte[trailer.Value.ZipSize];
+            var read = 0;
+            while (read < zipData.Length)
             {
-                var marker = System.Text.Encoding.ASCII.GetBytes("APPDATA\0");
-                const int markerLen = 8;
-                const int sizeLen = 4;
-
-                // Minimum size: marker + size + marker = 20 bytes
-                if (exeStream.Length < markerLen + sizeLen + markerLen)
+                var n = await exeStream.ReadAsync(zipData.AsMemory(read));
+                if (n == 0)
                     return null;
-
-                // Step 1: Read final marker (last 8 bytes)
-                exeStream.Seek(-markerLen, SeekOrigin.End);
-                var finalMarker = new byte[markerLen];
-                await exeStream.ReadAsync(finalMarker, 0, markerLen);
-
-                if (!finalMarker.SequenceEqual(marker))
-                    return null;
-
-                // Step 2: Read size (4 bytes before final marker)
-                exeStream.Seek(-(markerLen + sizeLen), SeekOrigin.End);
-                var sizeBytes = new byte[sizeLen];
-                await exeStream.ReadAsync(sizeBytes, 0, sizeLen);
-                var zipSize = BitConverter.ToInt32(sizeBytes, 0);
-
-                // Validate size
-                if (zipSize <= 0 || zipSize > exeStream.Length - markerLen - sizeLen - markerLen)
-                    return null;
-
-                // Step 3: Verify initial marker
-                exeStream.Seek(-(markerLen + sizeLen + zipSize + markerLen), SeekOrigin.End);
-                var initialMarker = new byte[markerLen];
-                await exeStream.ReadAsync(initialMarker, 0, markerLen);
-
-                if (!initialMarker.SequenceEqual(marker))
-                    return null;
-
-                // Step 4: Read ZIP data (right after initial marker)
-                var zipData = new byte[zipSize];
-                await exeStream.ReadAsync(zipData, 0, zipSize);
-
-                return new MemoryStream(zipData);
+                read += n;
             }
+
+            return new MemoryStream(zipData);
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Locates the appended payload trailer. On an unsigned exe the final
+    /// marker is the last 8 bytes of the file. On a signed exe the trailer was
+    /// embedded BEFORE signing, so the Authenticode certificate table (and up
+    /// to 7 bytes of alignment padding signtool inserts) sits AFTER it — the
+    /// search end is then the certificate table's file offset, taken from the
+    /// PE security data directory.
+    /// </summary>
+    public static (long ZipStart, int ZipSize)? LocateTrailer(Stream exeStream)
+    {
+        var marker = System.Text.Encoding.ASCII.GetBytes("APPDATA\0");
+        const int markerLen = 8;
+        const int sizeLen = 4;
+        const int minTrailer = markerLen + sizeLen + markerLen;
+
+        var searchEnd = GetTrailerSearchEnd(exeStream);
+
+        for (var padding = 0; padding <= 7; padding++)
+        {
+            var markerEnd = searchEnd - padding;
+            if (markerEnd < minTrailer)
+                break;
+
+            exeStream.Seek(markerEnd - markerLen, SeekOrigin.Begin);
+            var finalMarker = ReadExactly(exeStream, markerLen);
+            if (finalMarker == null || !finalMarker.SequenceEqual(marker))
+                continue;
+
+            exeStream.Seek(markerEnd - markerLen - sizeLen, SeekOrigin.Begin);
+            var sizeBytes = ReadExactly(exeStream, sizeLen);
+            if (sizeBytes == null)
+                continue;
+            var zipSize = BitConverter.ToInt32(sizeBytes, 0);
+            if (zipSize <= 0 || zipSize > markerEnd - minTrailer)
+                continue;
+
+            var initialMarkerStart = markerEnd - markerLen - sizeLen - zipSize - markerLen;
+            exeStream.Seek(initialMarkerStart, SeekOrigin.Begin);
+            var initialMarker = ReadExactly(exeStream, markerLen);
+            if (initialMarker == null || !initialMarker.SequenceEqual(marker))
+                continue;
+
+            return (initialMarkerStart + markerLen, zipSize);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// End of the region the trailer can occupy: the Authenticode certificate
+    /// table's file offset when present (IMAGE_DIRECTORY_ENTRY_SECURITY holds a
+    /// FILE offset, not an RVA), else the stream length. Any parse trouble
+    /// falls back to the stream length (unsigned behavior).
+    /// </summary>
+    public static long GetTrailerSearchEnd(Stream exeStream)
+    {
+        var length = exeStream.Length;
+        try
+        {
+            if (length < 0x40)
+                return length;
+
+            exeStream.Seek(0, SeekOrigin.Begin);
+            var mz = ReadExactly(exeStream, 2);
+            if (mz == null || mz[0] != (byte)'M' || mz[1] != (byte)'Z')
+                return length;
+
+            exeStream.Seek(0x3C, SeekOrigin.Begin);
+            var lfanewBytes = ReadExactly(exeStream, 4);
+            if (lfanewBytes == null)
+                return length;
+            var peOffset = BitConverter.ToInt32(lfanewBytes, 0);
+            if (peOffset <= 0 || peOffset > length - 0x100)
+                return length;
+
+            exeStream.Seek(peOffset, SeekOrigin.Begin);
+            var peSig = ReadExactly(exeStream, 4);
+            if (peSig == null || peSig[0] != (byte)'P' || peSig[1] != (byte)'E' || peSig[2] != 0 || peSig[3] != 0)
+                return length;
+
+            var optionalHeaderOffset = peOffset + 4 + 20;
+            exeStream.Seek(optionalHeaderOffset, SeekOrigin.Begin);
+            var magicBytes = ReadExactly(exeStream, 2);
+            if (magicBytes == null)
+                return length;
+            var magic = BitConverter.ToUInt16(magicBytes, 0);
+
+            // Data directory array offset within the optional header:
+            // PE32+ (0x20B) = 112, PE32 (0x10B) = 96. Security entry is index 4.
+            int dataDirectoryOffset;
+            if (magic == 0x20B)
+                dataDirectoryOffset = optionalHeaderOffset + 112;
+            else if (magic == 0x10B)
+                dataDirectoryOffset = optionalHeaderOffset + 96;
+            else
+                return length;
+
+            exeStream.Seek(dataDirectoryOffset + 4 * 8, SeekOrigin.Begin);
+            var securityEntry = ReadExactly(exeStream, 8);
+            if (securityEntry == null)
+                return length;
+
+            var certTableOffset = BitConverter.ToUInt32(securityEntry, 0);
+            var certTableSize = BitConverter.ToUInt32(securityEntry, 4);
+            if (certTableOffset > 0 && certTableSize > 0 && certTableOffset < length)
+                return certTableOffset;
+
+            return length;
+        }
+        catch
+        {
+            return length;
+        }
+    }
+
+    private static byte[]? ReadExactly(Stream stream, int count)
+    {
+        var buffer = new byte[count];
+        var read = 0;
+        while (read < count)
+        {
+            var n = stream.Read(buffer, read, count - read);
+            if (n == 0)
+                return null;
+            read += n;
+        }
+        return buffer;
     }
 
     /// <summary>
@@ -201,26 +308,14 @@ public class ResourceExtractor
             try
             {
                 using var stream = File.OpenRead(exePath);
-                var marker = System.Text.Encoding.ASCII.GetBytes("APPDATA\0");
+                var searchEnd = GetTrailerSearchEnd(stream);
+                sb.AppendLine($"Trailer search end: {searchEnd:N0} (file length {stream.Length:N0}; " +
+                              (searchEnd == stream.Length ? "no Authenticode certificate table)" : "Authenticode certificate table follows)"));
 
-                // Check final marker
-                stream.Seek(-8, SeekOrigin.End);
-                var finalBytes = new byte[8];
-                stream.Read(finalBytes, 0, 8);
-                var finalMarkerText = System.Text.Encoding.ASCII.GetString(finalBytes);
-                sb.AppendLine($"Final 8 bytes (as text): '{finalMarkerText}'");
-                sb.AppendLine($"Final 8 bytes (hex): {BitConverter.ToString(finalBytes)}");
-                sb.AppendLine($"Marker match: {finalBytes.SequenceEqual(marker)}");
-
-                if (finalBytes.SequenceEqual(marker))
-                {
-                    // Read size
-                    stream.Seek(-12, SeekOrigin.End);
-                    var sizeBytes = new byte[4];
-                    stream.Read(sizeBytes, 0, 4);
-                    var zipSize = BitConverter.ToInt32(sizeBytes, 0);
-                    sb.AppendLine($"ZIP size from footer: {zipSize:N0} bytes");
-                }
+                var trailer = LocateTrailer(stream);
+                sb.AppendLine($"Trailer found: {trailer != null}");
+                if (trailer != null)
+                    sb.AppendLine($"ZIP start: {trailer.Value.ZipStart:N0}, ZIP size: {trailer.Value.ZipSize:N0} bytes");
             }
             catch (Exception ex)
             {
@@ -243,18 +338,7 @@ public class ResourceExtractor
                 return false;
 
             using var exeStream = File.OpenRead(exePath);
-            var marker = System.Text.Encoding.ASCII.GetBytes("APPDATA\0");
-
-            if (exeStream.Length < marker.Length + 4)
-                return false;
-
-            // Seek to the end to find the final marker
-            exeStream.Seek(-marker.Length, SeekOrigin.End);
-
-            var finalMarker = new byte[marker.Length];
-            exeStream.Read(finalMarker, 0, marker.Length);
-
-            return finalMarker.SequenceEqual(marker);
+            return LocateTrailer(exeStream) != null;
         }
         catch
         {
@@ -312,19 +396,7 @@ public class ResourceExtractor
                 return null;
 
             using var exeStream = File.OpenRead(exePath);
-            const int markerLen = 8;
-            const int sizeLen = 4;
-
-            if (exeStream.Length < markerLen + sizeLen + markerLen)
-                return null;
-
-            // Seek to read size (4 bytes before final marker)
-            exeStream.Seek(-(markerLen + sizeLen), SeekOrigin.End);
-
-            var sizeBytes = new byte[sizeLen];
-            exeStream.Read(sizeBytes, 0, sizeLen);
-
-            return BitConverter.ToInt32(sizeBytes, 0);
+            return LocateTrailer(exeStream)?.ZipSize;
         }
         catch
         {

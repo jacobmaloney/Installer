@@ -48,6 +48,7 @@ when launched from one.
 | `sql.database` | no | `Conduit` | |
 | `sql.allowExpressInstall` | no | `true` | Bootstrap SQL Express only when no usable instance exists. |
 | `sql.expressSetupPath` | no | `redist\SQLEXPR*.exe` | Override for the setup exe location. |
+| `sql.expressSetupSha256` | no | — | Pinned SHA-256 for the setup exe. When set it is the **sole** authenticity gate (exact match or refuse); when unset the redist must carry a valid Authenticode signature whose signer O=`Microsoft Corporation` and whose chain ends at a Microsoft root CA. |
 | `sql.grantServiceAccess` | no | `true` | On an **existing** instance, grant `NT AUTHORITY\SYSTEM` a login + `dbcreator` so the LocalSystem service can create its DB. |
 
 JSON comments and trailing commas are allowed.
@@ -64,7 +65,11 @@ JSON comments and trailing commas are allowed.
    SQL Express install as dedicated instance **CONDUIT** (Windows auth only,
    TCP/named pipes/Browser disabled — local shared-memory access only,
    `NT AUTHORITY\SYSTEM` sysadmin so the service can create its DB).
-   Never installs over an existing usable instance.
+   Never installs over an existing usable instance. Before the redist is
+   executed ELEVATED it must pass the authenticity gate (valid Microsoft
+   Authenticode chain, or the `sql.expressSetupSha256` pin) — the side-by-side
+   file is not covered by the installer exe's own signature. Failure = exit 33,
+   redist never runs.
 3. **Stop existing service** (upgrade), snapshot `appsettings*.json`.
 4. **Extract** the embedded Conduit publish to the install path.
 5. **Stamp the BASE `appsettings.json`** (never the environment file — Conduit's
@@ -101,6 +106,7 @@ JSON comments and trailing commas are allowed.
 | 30 | No usable SQL instance and Express bootstrap unavailable |
 | 31 | SQL Express silent install failed |
 | 32 | SQL connect failed |
+| 33 | SQL Express redist failed the authenticity gate (Authenticode/pin) and was not executed |
 | 40 | Payload extraction failed |
 | 50 | appsettings.json stamping failed |
 | 60 | ProgramData ACL lock-down failed (install aborts — password would be world-readable) |
@@ -120,6 +126,12 @@ JSON comments and trailing commas are allowed.
   SYSTEM is sysadmin via setup; on a reused existing instance, the installer
   grants SYSTEM `dbcreator` only (flag: `sql.grantServiceAccess`). A dedicated
   low-privilege service account is the GA hardening follow-up.
+- **Redist authenticity gate** — the SQL Express setup exe ships side-by-side
+  and is outside the installer's Authenticode coverage, so
+  `RedistAuthenticityVerifier` refuses to run it elevated unless it matches the
+  configured SHA-256 pin or carries a valid Microsoft Authenticode signature
+  (parsed O RDN + Microsoft root CA). See `docs/ReleasePipeline.md` for the
+  full signing/verification contract.
 - **No Programs-and-Features registration yet** — the existing UninstallWindow
   is IIS/IdentityCenter-shaped; registering an uninstall entry that runs the
   wrong engine would be worse than none. Follow-up item.
